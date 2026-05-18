@@ -88,7 +88,7 @@ target_link_libraries(accel_sim PRIVATE trace-driven trace-parser)
 
 # allow failure for stubgen
 add_custom_target(gen_pyi ALL
-    COMMAND $ENV{HOME}/.local/bin/stubgen -m accel_sim -o . || (exit 0)
+    COMMAND /root/miniconda3/envs/lut_tc/bin/stubgen -m accel_sim -o . || (exit 0)
     DEPENDS accel_sim
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     )
