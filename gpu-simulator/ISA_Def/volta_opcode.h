@@ -45,6 +45,10 @@ static const std::unordered_map<std::string, OpcodeChar> Volta_OpcodeMap = {
     // Tensor Core Instructions
     // Execute Tensor Core Instructions on SPECIALIZED_UNIT_3
     {"HMMA", OpcodeChar(OP_HMMA, SPECIALIZED_UNIT_3_OP)},
+    {"LMMA", OpcodeChar(OP_LMMA, SPECIALIZED_UNIT_3_OP)},
+    {"IMMA", OpcodeChar(OP_IMMA, SPECIALIZED_UNIT_3_OP)},
+    {"DMMA", OpcodeChar(OP_DMMA, SPECIALIZED_UNIT_3_OP)},
+    {"BMMA", OpcodeChar(OP_BMMA, SPECIALIZED_UNIT_3_OP)},
 
     // Double Point Instructions
     {"DADD", OpcodeChar(OP_DADD, DP_OP)},

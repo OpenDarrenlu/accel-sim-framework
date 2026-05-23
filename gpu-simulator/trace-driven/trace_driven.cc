@@ -399,6 +399,14 @@ bool trace_warp_inst_t::parse_from_trace_struct(
           1)  // Make sure initiaion interval never goes below 1
         initiation_interval = 1;
       break;
+    case OP_LMMA:
+      // LMMA (LUT-based MMA) has its own latency/initiation interval
+      // configured via -trace_opcode_latency_initiation_lmma.
+      // The opcode format is: LMMA.{M}{N}{K}.{A_dtype}{W_dtype}{Accum_dtype}{O_dtype}
+      // e.g., LMMA.16.8.16.F16.I2.F16.F16
+      tconfig->get_lmma_latency(latency, initiation_interval);
+      m_is_lmma = true;  // Mark this instruction as LMMA for functional sim
+      break;
     default:
       break;
   }
@@ -440,6 +448,12 @@ void trace_config::reg_options(option_parser_t opp) {
                          "driven mode <latency,initiation>",
                          "4,1");
 
+  option_parser_register(opp, "-trace_opcode_latency_initiation_lmma",
+                         OPT_CSTR, &trace_opcode_latency_initiation_lmma,
+                         "Opcode latencies and initiation for LMMA (LUT-based "
+                         "MMA) in trace driven mode <latency,initiation>",
+                         "8,8");
+
   for (unsigned j = 0; j < SPECIALIZED_UNIT_NUM; ++j) {
     std::stringstream ss;
     ss << "-trace_opcode_latency_initiation_spec_op_" << j + 1;
@@ -458,6 +472,9 @@ void trace_config::parse_config() {
   sscanf(trace_opcode_latency_initiation_sfu, "%u,%u", &sfu_latency, &sfu_init);
   sscanf(trace_opcode_latency_initiation_tensor, "%u,%u", &tensor_latency,
          &tensor_init);
+
+  sscanf(trace_opcode_latency_initiation_lmma, "%u,%u", &lmma_latency,
+         &lmma_init);
 
   for (unsigned j = 0; j < SPECIALIZED_UNIT_NUM; ++j) {
     sscanf(trace_opcode_latency_initiation_specialized_op[j], "%u,%u",
@@ -595,6 +612,10 @@ const warp_inst_t *trace_shader_core_ctx::get_next_inst(unsigned warp_id,
         }
       }
       m_barriers.warp_exit(warp_id);
+
+      // Dump LMMA functional simulation results when this warp finishes.
+      // For multi-warp kernels, each warp dumps its own result.
+      dump_lmma_func_sim_results();
     }
   }
   return ret;
@@ -623,6 +644,16 @@ void trace_shader_core_ctx::init_traces(unsigned start_warp, unsigned end_warp,
     m_trace_warp->set_next_pc(m_trace_warp->get_start_trace_pc());
     m_trace_warp->set_kernel(&trace_kernel);
   }
+
+  // Initialize LMMA functional simulation with kernel dimensions
+  kernel_trace_t *kinfo = trace_kernel.get_trace_info();
+  m_kernel_grid_x = kinfo->grid_dim_x;
+  m_kernel_grid_y = kinfo->grid_dim_y;
+  m_kernel_grid_z = kinfo->grid_dim_z;
+  m_kernel_block_x = kinfo->tb_dim_x;
+  m_kernel_block_y = kinfo->tb_dim_y;
+  m_kernel_block_z = kinfo->tb_dim_z;
+  init_lmma_func_sim();
 }
 
 void trace_shader_core_ctx::checkExecutionStatusAndUpdate(warp_inst_t &inst,
@@ -655,6 +686,15 @@ void trace_shader_core_ctx::func_exec_inst(warp_inst_t &inst) {
   if (inst.is_load() || inst.is_store()) {
     inst.generate_mem_accesses();
   }
+
+  // LMMA functional simulation: when we encounter an LMMA instruction,
+  // trigger the LUT-based computation for this warp.
+  if (inst.m_is_lmma) {
+    unsigned warpId = inst.warp_id();
+    // For simple test kernels with 1 block, warp_id maps directly.
+    // In general we'd need block coordinates from the CTA context.
+    execute_lmma_func_sim(warpId, 0, 0, 0);
+  }
 }
 
 void trace_shader_core_ctx::issue_warp(register_set &warp,
@@ -666,4 +706,190 @@ void trace_shader_core_ctx::issue_warp(register_set &warp,
   // delete warp_inst_t class here, it is not required anymore by gpgpu-sim
   // after issue
   delete pI;
+}
+
+// ------------------------------------------------------------------
+// LMMA Functional Simulation
+// ------------------------------------------------------------------
+
+void trace_shader_core_ctx::init_lmma_func_sim() {
+  m_lmma_func_sim_enabled = true;
+  m_lmma_results_dumped = false;
+  m_test_A.resize(LMMA_M * LMMA_K);
+  m_test_W.resize(LMMA_N * LMMA_K);
+  m_test_C_ref.resize(LMMA_M * LMMA_N);
+
+  // Simple LCG random number generator (seed=42, same as Python script)
+  unsigned seed = 42;
+  auto lcg_rand = [&seed]() -> float {
+    seed = seed * 1103515245u + 12345u;
+    return (float)(seed & 0x7FFFu) / 32768.0f;  // [0, 1)
+  };
+
+  // Generate A: random in [-5, 5]
+  for (int i = 0; i < LMMA_M * LMMA_K; i++) {
+    m_test_A[i] = lcg_rand() * 10.0f - 5.0f;
+  }
+
+  // Generate W: INT2 quantized values {-2, -1, 0, 1}
+  for (int i = 0; i < LMMA_N * LMMA_K; i++) {
+    unsigned r = (unsigned)(lcg_rand() * 4.0f);  // {0, 1, 2, 3}
+    m_test_W[i] = (int)r - 2;  // map to {-2, -1, 0, 1}
+  }
+
+  // Compute reference C = A @ W.T (FP32 accumulation)
+  for (int m = 0; m < LMMA_M; m++) {
+    for (int n = 0; n < LMMA_N; n++) {
+      float acc = 0.0f;
+      for (int k = 0; k < LMMA_K; k++) {
+        acc += m_test_A[m * LMMA_K + k] * (float)m_test_W[n * LMMA_K + k];
+      }
+      m_test_C_ref[m * LMMA_N + n] = acc;
+    }
+  }
+
+  printf("[LMMA-FuncSim] Initialized test data: M=%d, N=%d, K=%d, W_BITS=%d\n",
+         LMMA_M, LMMA_N, LMMA_K, LMMA_W_BITS);
+}
+
+// Helper: simulate FP16 quantization for LUT table entries.
+// FP16 has 10 bits of mantissa. We quantize the mantissa to 10 bits
+// to mimic on-chip SRAM storage precision.
+static float quantize_fp16(float val) {
+  if (val == 0.0f) return 0.0f;
+  int exponent;
+  float mantissa = frexpf(val, &exponent);  // val = mantissa * 2^exponent
+  // Round mantissa to 10 bits (1 implicit + 10 explicit)
+  float q_mantissa = roundf(mantissa * 1024.0f) / 1024.0f;
+  return ldexpf(q_mantissa, exponent);
+}
+
+void trace_shader_core_ctx::execute_lmma_func_sim(unsigned warp_id,
+                                                   unsigned tb_x, unsigned tb_y,
+                                                   unsigned tb_z) {
+  if (!m_lmma_func_sim_enabled) return;
+  if (m_warp_lmma_done[warp_id]) return;
+
+  // LUT-based mpGEMM using grouped table lookup (matching paper Figure 3).
+  // For each group of K_GROUP activations and weights, we precompute a LUT
+  // indexed by the weight values. The LUT entries are quantized to FP16 to
+  // simulate on-chip SRAM storage.
+  const int K_GROUP = 4;
+  const int NUM_GROUPS = LMMA_K / K_GROUP;  // 8 groups for K=32
+  const int NUM_WEIGHT_VALUES = 1 << LMMA_W_BITS;  // 4 for INT2
+  const int LUT_SIZE = 256;  // NUM_WEIGHT_VALUES^K_GROUP = 4^4 = 256
+
+  std::vector<float> &C = m_warp_C[warp_id];
+  C.resize(LMMA_M * LMMA_N, 0.0f);
+
+  for (int m = 0; m < LMMA_M; m++) {
+    for (int n = 0; n < LMMA_N; n++) {
+      float acc = 0.0f;
+
+      for (int g = 0; g < NUM_GROUPS; g++) {
+        // 1. Extract activation tile A_tile[K_GROUP]
+        float A_tile[K_GROUP];
+        for (int k = 0; k < K_GROUP; k++) {
+          A_tile[k] = m_test_A[m * LMMA_K + g * K_GROUP + k];
+        }
+
+        // 2. Extract weight tile W_tile[K_GROUP] (INT2 values {-2,-1,0,1})
+        int W_tile[K_GROUP];
+        for (int k = 0; k < K_GROUP; k++) {
+          W_tile[k] = m_test_W[n * LMMA_K + g * K_GROUP + k];
+        }
+
+        // 3. Precompute LUT for this activation tile.
+        //    LUT is indexed by the encoded weight pattern.
+        //    For INT2, each weight has 4 possible values, so with K_GROUP=4
+        //    the LUT has 4^4 = 256 entries.
+        float lut[LUT_SIZE];
+        for (int idx = 0; idx < LUT_SIZE; idx++) {
+          // Decode index into K_GROUP weight values
+          int tmp = idx;
+          float sum = 0.0f;
+          for (int k = 0; k < K_GROUP; k++) {
+            int w_enc = tmp % NUM_WEIGHT_VALUES;  // {0,1,2,3}
+            tmp /= NUM_WEIGHT_VALUES;
+            // Map encoded value back to original weight: {-2,-1,0,1}
+            int w_val = w_enc - (NUM_WEIGHT_VALUES / 2);
+            sum += A_tile[k] * (float)w_val;
+          }
+          // Simulate FP16 table quantization (on-chip LUT storage)
+          lut[idx] = quantize_fp16(sum);
+        }
+
+        // 4. Lookup: encode W_tile into LUT index.
+        //    The loop order must match the decoding order in precompute
+        //    (k=0 is the least significant digit).
+        int lut_idx = 0;
+        for (int k = K_GROUP - 1; k >= 0; k--) {
+          int w_enc = W_tile[k] + (NUM_WEIGHT_VALUES / 2);
+          lut_idx = lut_idx * NUM_WEIGHT_VALUES + w_enc;
+        }
+
+        // 5. Accumulate
+        acc += lut[lut_idx];
+      }
+      C[m * LMMA_N + n] = acc;
+    }
+  }
+
+  m_warp_lmma_done[warp_id] = true;
+  printf("[LMMA-FuncSim] Warp %u executed LUT-based functional simulation.\n",
+         warp_id);
+}
+
+void trace_shader_core_ctx::dump_lmma_func_sim_results() {
+  if (!m_lmma_func_sim_enabled) return;
+  if (m_warp_C.empty()) return;
+  if (m_lmma_results_dumped) return;  // Prevent duplicate output
+  m_lmma_results_dumped = true;
+
+  printf("\n========== LMMA Functional Simulation Results ==========\n");
+
+  // For multi-warp kernels (e.g., cuBLAS GEMM), each warp computes the
+  // same C tile with identical fixed test data. Use only the first warp's
+  // result to avoid over-counting.
+  std::vector<float> C_final = m_warp_C.begin()->second;
+
+  printf("C matrix (M=%d, N=%d):\n", LMMA_M, LMMA_N);
+  for (int m = 0; m < LMMA_M; m++) {
+    printf("  Row %2d: ", m);
+    for (int n = 0; n < LMMA_N; n++) {
+      printf("%8.4f ", C_final[m * LMMA_N + n]);
+    }
+    printf("\n");
+  }
+
+  printf("\nReference C matrix:\n");
+  for (int m = 0; m < LMMA_M; m++) {
+    printf("  Row %2d: ", m);
+    for (int n = 0; n < LMMA_N; n++) {
+      printf("%8.4f ", m_test_C_ref[m * LMMA_N + n]);
+    }
+    printf("\n");
+  }
+
+  // Compute max absolute error
+  float max_err = 0.0f;
+  float avg_err = 0.0f;
+  for (int i = 0; i < LMMA_M * LMMA_N; i++) {
+    float err = fabsf(C_final[i] - m_test_C_ref[i]);
+    if (err > max_err) max_err = err;
+    avg_err += err;
+  }
+  avg_err /= (LMMA_M * LMMA_N);
+
+  printf("\nMax absolute error: %.6f\n", max_err);
+  printf("Avg absolute error: %.6f\n", avg_err);
+
+  if (max_err < 0.1f) {
+    printf("LMMA FUNCTIONAL VERIFICATION: PASSED\n");
+  } else {
+    printf("LMMA FUNCTIONAL VERIFICATION: FAILED (error %.6f >= 0.1)\n",
+           max_err);
+  }
+  printf("========================================================\n\n");
+  fflush(stdout);
 }

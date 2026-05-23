@@ -79,6 +79,8 @@ class trace_warp_inst_t : public warp_inst_t {
       const class trace_config *tconfig,
       const class kernel_trace_t *kernel_trace_info);
 
+  unsigned get_opcode() const { return m_opcode; }
+
  private:
   unsigned m_opcode;
 };
@@ -122,12 +124,18 @@ class trace_config {
   void parse_config();
   void reg_options(option_parser_t opp);
   char *get_traces_filename() { return g_traces_filename; }
+  void get_lmma_latency(unsigned &latency,
+                        unsigned &initiation_interval) const {
+    latency = lmma_latency;
+    initiation_interval = lmma_init;
+  }
 
  private:
   unsigned int_latency, fp_latency, dp_latency, sfu_latency, tensor_latency;
   unsigned int_init, fp_init, dp_init, sfu_init, tensor_init;
   unsigned specialized_unit_latency[SPECIALIZED_UNIT_NUM];
   unsigned specialized_unit_initiation[SPECIALIZED_UNIT_NUM];
+  unsigned lmma_latency, lmma_init;
 
   char *g_traces_filename;
   char *trace_opcode_latency_initiation_int;
@@ -136,6 +144,7 @@ class trace_config {
   char *trace_opcode_latency_initiation_sfu;
   char *trace_opcode_latency_initiation_tensor;
   char *trace_opcode_latency_initiation_specialized_op[SPECIALIZED_UNIT_NUM];
+  char *trace_opcode_latency_initiation_lmma;
 };
 
 class trace_shd_warp_t : public shd_warp_t {
@@ -199,6 +208,9 @@ class trace_shader_core_ctx : public shader_core_ctx {
     create_shd_warp();
     create_schedulers();
     create_exec_pipeline();
+    m_lmma_func_sim_enabled = false;
+    m_kernel_grid_x = m_kernel_grid_y = m_kernel_grid_z = 1;
+    m_kernel_block_x = m_kernel_block_y = m_kernel_block_z = 1;
   }
 
   virtual void checkExecutionStatusAndUpdate(warp_inst_t &inst, unsigned t,
@@ -224,9 +236,38 @@ class trace_shader_core_ctx : public shader_core_ctx {
                           const active_mask_t &active_mask, unsigned warp_id,
                           unsigned sch_id);
 
+  // LMMA functional simulation interface
+  void init_lmma_func_sim();
+  void execute_lmma_func_sim(unsigned warp_id, unsigned tb_x, unsigned tb_y,
+                             unsigned tb_z);
+  void dump_lmma_func_sim_results();
+
  private:
   void init_traces(unsigned start_warp, unsigned end_warp,
                    kernel_info_t &kernel);
+
+  // LMMA functional simulation state
+  bool m_lmma_func_sim_enabled;
+
+  // Test problem dimensions (match CUTLASS GEMM: M=8, N=16, K=32)
+  static constexpr int LMMA_M = 8;
+  static constexpr int LMMA_N = 16;
+  static constexpr int LMMA_K = 32;
+  static constexpr int LMMA_W_BITS = 2;
+
+  // Pre-defined test data (FP32 for computation accuracy)
+  std::vector<float> m_test_A;       // M*K activations
+  std::vector<int> m_test_W;         // N*K quantized weights (as int)
+  std::vector<float> m_test_C_ref;   // M*N reference result
+
+  // Per-warp computation state
+  std::map<unsigned, bool> m_warp_lmma_done;
+  std::map<unsigned, std::vector<float>> m_warp_C;
+  bool m_lmma_results_dumped;  // prevent duplicate output in multi-warp kernels
+
+  // Kernel launch dimensions for tile mapping
+  unsigned m_kernel_grid_x, m_kernel_grid_y, m_kernel_grid_z;
+  unsigned m_kernel_block_x, m_kernel_block_y, m_kernel_block_z;
 };
 
 types_of_operands get_oprnd_type(op_type op, special_ops sp_op);

@@ -61,6 +61,7 @@ static const std::unordered_map<unsigned, unsigned> OpcodePowerMap = {
     {OP_HSET2, FP__OP},
     {OP_HSETP2, FP__OP},
     {OP_HMMA, TENSOR__OP},
+    {OP_LMMA, TENSOR__OP},
     {OP_DADD, DP___OP},
     {OP_DFMA, DP_MUL_OP},
     {OP_DMUL, DP_MUL_OP},

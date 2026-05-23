@@ -32,6 +32,7 @@ enum TraceInstrOpcode {
   OP_HSET2,
   OP_HSETP2,
   OP_HMMA,
+  OP_LMMA,
   OP_DADD,
   OP_DFMA,
   OP_DMUL,
