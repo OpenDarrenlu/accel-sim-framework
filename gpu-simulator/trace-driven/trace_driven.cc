@@ -711,6 +711,22 @@ void trace_shader_core_ctx::issue_warp(register_set &warp,
 // ------------------------------------------------------------------
 // LMMA Functional Simulation
 // ------------------------------------------------------------------
+//
+// PURPOSE: Numerical correctness validation for the LUT-based MMA path.
+// This is NOT a general functional simulator for arbitrary GEMM kernels.
+//
+// CONSTRAINTS:
+//   - Fixed dimensions M=8, N=16, K=32 (must match proxy kernel)
+//   - Fixed INT2 weight quantization ({-2, -1, 0, 1})
+//   - K_GROUP=4 grouped LUT lookup with 256 entries
+//   - FP16 quantization of LUT entries (10-bit mantissa)
+//
+// VALID TARGET: verify_lutsage/sageattn_lut_proxy.cu (single-tile GEMM)
+// INVALID TARGET: Real multi-tile kernels (e.g., Triton sageattn_lut);
+//   functional sim runs but result comparison is meaningless.
+//
+// DESIGN: Each warp computes the same C tile with identical fixed test data.
+// For multi-warp proxy kernels, only the first warp's result is checked.
 
 void trace_shader_core_ctx::init_lmma_func_sim() {
   m_lmma_func_sim_enabled = true;
@@ -847,10 +863,15 @@ void trace_shader_core_ctx::dump_lmma_func_sim_results() {
   m_lmma_results_dumped = true;
 
   printf("\n========== LMMA Functional Simulation Results ==========\n");
+  printf("NOTE: Results below are valid ONLY for the proxy kernel\n");
+  printf("      (verify_lutsage/sageattn_lut_proxy.cu, M=8,N=16,K=32).\n");
+  printf("      Real multi-tile kernels are NOT validated here.\n\n");
 
-  // For multi-warp kernels (e.g., cuBLAS GEMM), each warp computes the
-  // same C tile with identical fixed test data. Use only the first warp's
-  // result to avoid over-counting.
+  // For multi-warp proxy kernels (e.g., cuBLAS GEMM with 4 warps), each
+  // warp computes the SAME C tile because the proxy has only one tile.
+  // Use only the first warp's result to avoid over-counting.
+  // WARNING: For real multi-tile kernels, different warps compute different
+  // tiles, so this simplification does NOT apply.
   std::vector<float> C_final = m_warp_C.begin()->second;
 
   printf("C matrix (M=%d, N=%d):\n", LMMA_M, LMMA_N);

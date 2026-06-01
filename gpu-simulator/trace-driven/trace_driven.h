@@ -247,9 +247,16 @@ class trace_shader_core_ctx : public shader_core_ctx {
                    kernel_info_t &kernel);
 
   // LMMA functional simulation state
+  // NOTE: The functional simulation below uses FIXED dimensions (M=8,N=16,K=32)
+  // that match the proxy kernel (sageattn_lut_proxy.cu). It is designed for
+  // numerical correctness validation of the LUT lookup path ONLY, not for
+  // general kernel execution. Real kernels (e.g., sageattn_lut Triton) have
+  // different dimensions and tile mappings; functional sim results for those
+  // are not meaningful and are intentionally ignored.
   bool m_lmma_func_sim_enabled;
 
-  // Test problem dimensions (match CUTLASS GEMM: M=8, N=16, K=32)
+  // Test problem dimensions (match proxy kernel: M=8, N=16, K=32)
+  // These MUST match the proxy CUDA kernel compiled in verify_lutsage/.
   static constexpr int LMMA_M = 8;
   static constexpr int LMMA_N = 16;
   static constexpr int LMMA_K = 32;
@@ -261,11 +268,15 @@ class trace_shader_core_ctx : public shader_core_ctx {
   std::vector<float> m_test_C_ref;   // M*N reference result
 
   // Per-warp computation state
+  // Each warp computes the SAME C tile with identical fixed test data
+  // (because the proxy kernel has only one tile). For multi-warp kernels
+  // we only check the first warp's result to avoid over-counting.
   std::map<unsigned, bool> m_warp_lmma_done;
   std::map<unsigned, std::vector<float>> m_warp_C;
   bool m_lmma_results_dumped;  // prevent duplicate output in multi-warp kernels
 
-  // Kernel launch dimensions for tile mapping
+  // Kernel launch dimensions for tile mapping (currently unused but kept
+  // for future extension to multi-tile functional simulation)
   unsigned m_kernel_grid_x, m_kernel_grid_y, m_kernel_grid_z;
   unsigned m_kernel_block_x, m_kernel_block_y, m_kernel_block_z;
 };

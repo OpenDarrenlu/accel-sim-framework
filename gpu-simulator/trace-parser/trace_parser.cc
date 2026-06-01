@@ -68,6 +68,13 @@ std::vector<std::string> inst_trace_t::get_opcode_tokens() const {
 
 unsigned inst_trace_t::get_datawidth_from_opcode(
     const std::vector<std::string> &opcode) const {
+  // LMMA opcodes contain shape tokens (e.g., "16816" in "LMMA.16816.F16.I2")
+  // that are NOT data widths. Skip LMMA to avoid misinterpreting shape as
+  // a 16816-bit (2102-byte) width.
+  if (!opcode.empty() && opcode[0] == "LMMA") {
+    return 0;
+  }
+
   for (unsigned i = 0; i < opcode.size(); ++i) {
     if (is_number(opcode[i])) {
       return (std::stoi(opcode[i], NULL) / 8);
