@@ -689,7 +689,8 @@ void trace_shader_core_ctx::func_exec_inst(warp_inst_t &inst) {
 
   // LMMA functional simulation: when we encounter an LMMA instruction,
   // trigger the LUT-based computation for this warp.
-  if (inst.m_is_lmma) {
+  trace_warp_inst_t *trace_inst = dynamic_cast<trace_warp_inst_t *>(&inst);
+  if (trace_inst && trace_inst->m_is_lmma) {
     unsigned warpId = inst.warp_id();
     // For simple test kernels with 1 block, warp_id maps directly.
     // In general we'd need block coordinates from the CTA context.
